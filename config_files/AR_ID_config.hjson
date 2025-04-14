@@ -150,7 +150,7 @@ IVT_climatology_timestep_hrs: 6
 # Minimum IVT threshold (kg/m/s) for a feature to potentially be considered an AR
 # - v2 default value for Northern Hemisphere: 150 kg/m/s
 # - Value for past work on Antarctic ARs: 50 kg/m/s
-IVT_thresh: 200
+IVT_thresh: 150
 
 # Minimum IVT percentile rank threshold for a feature to potentially be considered an AR
 # - v2 default value for Northern Hemisphere: 85

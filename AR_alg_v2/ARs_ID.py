@@ -262,7 +262,7 @@ def _sift_fpaths(AR_config, data_dir, begin_dt, end_dt):
 
 
 def build_wrap_arrays(AR_config, lats_subset, ix_df_t, IVT_at_pctiles_ds_doy, ll_mean_wind, ivt_dataset_cache):
-       """
+    """
     Create "wrap arrays" that encircle the entire zonal width of the globe *twice*,
     so that features that cross the antimeridian and/or a pole can be handled
     as contiguous features by the image processing functions.
@@ -282,10 +282,7 @@ def build_wrap_arrays(AR_config, lats_subset, ix_df_t, IVT_at_pctiles_ds_doy, ll
 
     # Use cached dataset or open if not already in cache
     if IVT_fpath not in ivt_dataset_cache:
-        print(f"Opening IVT file: {IVT_fpath}")
         ivt_dataset_cache[IVT_fpath] = xr.open_dataset(IVT_fpath, engine="netcdf4")
-    else:
-        print(f"Reusing cached IVT dataset: {IVT_fpath}")
 
     dataset = ivt_dataset_cache[IVT_fpath]
 
@@ -403,8 +400,6 @@ def _full_zonal_wraps_filter(AR_config, label_array_prelim, lons_wrap, lats):
                 continue
 
             if np.sum(binary_array_label[:, lat_ix, :]) == lons_wrap.shape[0]:  
-                print(f"Adjusting wrap for feature {label} at lat_ix={lat_ix}")
-
                 # Make label array in second wrap equal to 0
                 label_array_replace_ixs_full = np.where(label_array_prelim == label)
                 label_array_second_wrap_ixs = np.where(label_array_replace_ixs_full[2] >= int(lons_wrap.shape[0] / 2))
