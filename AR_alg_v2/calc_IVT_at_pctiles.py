@@ -17,144 +17,106 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import ast
-
-from AR_alg_v2.misc_utils import rename_coords
-
+import cftime
+from pathlib import Path
 
 def calc_IVT_at_pctiles(AR_config, start_year, end_year, timestep_hrs, start_doy, end_doy):
     """
     Calculate IVT values at a range of percentiles for each julian day of the year.
     """
-    
-    IVT_dir = AR_config['IVT_dir']
-    IVT_paths = sorted(glob.glob(IVT_dir+'*.nc'))
-    years_str = [str(year) for year in np.arange(int(start_year), int(end_year)+1, 1)]
-    IVT_paths_filtered = [p for p in IVT_paths if p[-15:-11] in years_str]
-    IVT_ds_full = rename_coords(xr.open_mfdataset(IVT_paths_filtered))
-    IVT_ds_full['time'] = pd.to_datetime(IVT_ds_full.time.data)
-        
-    begin_dt = dt.datetime(int(start_year), 1, 1, 0)
-    end_dt = dt.datetime(int(end_year), 12, 31, 21)
-    times = pd.date_range(begin_dt, end_dt, freq=timestep_hrs+'H')
-    
-    lats_subset = np.arange(
-        AR_config['min_lat'],
-        AR_config['max_lat']+AR_config['lat_res'],
-        AR_config['lat_res']
-        )
-    lons = IVT_ds_full.lon.data[:]
-        
-    IVT_ds = IVT_ds_full.IVT.sel(time=times, lat=lats_subset)
+    #original code used IVT_dir
+    IVT_path = AR_config['IVT_path']
+    ds = xr.open_dataset(IVT_path)
 
-    # For leap years, subtract 1 from all doys after the leap day to get corrected doy
-    leap_years = np.arange(1900, int(end_year)+1, 4)
+    #Detect calendar type
+    time_data = ds.time.data
+    use_cftime = isinstance(time_data[0], cftime.Datetime360Day)
+    if use_cftime:
+        print("Detected 360-day calendar.")
+    else:
+        print("Standard calendar detected.")
+        ds = ds.assign_coords(time=pd.to_datetime(time_data))
+
+    # Time filtering using attribute-based logic
+    ds = ds.where(
+        (ds.time.dt.year >= start_year) & 
+        (ds.time.dt.year <= end_year) & 
+        (ds.time.dt.hour % int(timestep_hrs) == 0),
+        drop=True
+    )
+
+    # Spatial subsetting
+    lats = np.arange(AR_config['min_lat'], AR_config['max_lat'] + AR_config['lat_res'], AR_config['lat_res'])
+    ds = ds.sel(lat=lats, method='nearest')
+
+    # Adjust DOY
+    leap_years = np.arange(1900, end_year + 1, 4)
     doys_fixed = []
-    for t in pd.to_datetime(IVT_ds.time):
-        doy = t.timetuple().tm_yday
-        if (t.year in leap_years) and (doy >= 60):
-            doys_fixed.append((doy - 1))
+    for t in ds.time.values:
+        if use_cftime:
+            doy = t.dayofyr
+        else:
+            doy = t.timetuple().tm_yday
+        if (t.year in leap_years) and doy >= 60:
+            doys_fixed.append(doy - 1)
         else:
             doys_fixed.append(doy)
-    IVT_ds['doy'] = xr.DataArray(doys_fixed, coords=[IVT_ds.time], dims=['time'])
-    
-    doys = np.arange(int(start_doy),int(end_doy)+1,1)
-    pctiles = np.array(ast.literal_eval(AR_config['IVT_percentiles_to_calc']))
-    IVT_pctiles_out_data = np.empty(
-        (len(doys), len(pctiles), IVT_ds.lat.shape[0], IVT_ds.lon.shape[0])
-        )
-    
+    ds['doy'] = ('time', doys_fixed)
+
+    doys = np.arange(int(start_doy), int(end_doy) + 1)
+    pctiles = np.array(ast.literal_eval(str(AR_config['IVT_percentiles_to_calc'])))
+    IVT_data = ds['ivt_magnitude']
+
+    output = np.empty((len(doys), len(pctiles), ds.lat.shape[0], ds.lon.shape[0]))
+
     for i, doy in enumerate(doys):
-        # "Dummy" time will only be used to get doy of window start and end
+                # "Dummy" time will only be used to get doy of window start and end
         # - For dummy time, use a year where neither the year before or after
         #   is a leap year
-        t_dummy = dt.datetime(1902,1,1,0) + timedelta(days = int(doy-1))
-        window_start_doy = (t_dummy - timedelta(days=15)).timetuple().tm_yday
-        window_end_doy = (t_dummy + timedelta(days=15)).timetuple().tm_yday
+        t_dummy = dt.datetime(1902, 1, 1) + timedelta(days=int(doy) - 1)
+        win_start = (t_dummy - timedelta(days=15)).timetuple().tm_yday
+        win_end = (t_dummy + timedelta(days=15)).timetuple().tm_yday
         
         # Handle the case where window starts at the end of one year and
         # continues into the next
-        if window_start_doy > window_end_doy:
-            window_doys = np.concatenate((np.arange(window_start_doy, 366, 1),
-                                          np.arange(1, window_end_doy + 1, 1)))
+        if win_start > win_end:
+            window_doys = np.concatenate((np.arange(win_start, 366), np.arange(1, win_end + 1)))
         else:
-            window_doys = np.arange(window_start_doy, window_end_doy + 1, 1)
-            
-        IVT_ds_window = IVT_ds.sel(time=IVT_ds.time.dt.dayofyear.isin(window_doys))
-        IVT_at_pctiles_doy = IVT_ds_window.chunk(dict(time=-1)).quantile(
-            pctiles/100, dim='time', skipna=True
-            )
-        IVT_pctiles_out_data[i,:,:,:] = IVT_at_pctiles_doy.to_numpy()
-        
+            window_doys = np.arange(win_start, win_end + 1)
+
+        ds_window = IVT_data.sel(time=ds.time.dt.dayofyear.isin(window_doys))
+        q = ds_window.chunk(dict(time=-1)).quantile(pctiles / 100, dim='time', skipna=True)
+        output[i] = q.to_numpy()
+
         print(f'Finished doy: {doy} at '+str(dt.datetime.now()))
 
-    return doys, pctiles, IVT_ds.lat.data[:], lons, IVT_pctiles_out_data
+    return doys, pctiles, ds.lat.data, ds.lon.data, output
 
-
-def write_IVT_at_pctiles_output_file(AR_config, start_year, end_year, timestep_hrs,
-                                     doys, pctiles, lats, lons, IVT_pctiles_out_data):
-    """
+def write_output(AR_config, start_year, end_year, timestep_hrs, doys, pctiles, lats, lons, data):
+        """
     Write IVT at percentiles output file with metadata supplied by the AR ID
     configuration.
     """
-    
-    IVT_at_pctiles_ds = xr.Dataset(
-        data_vars={},
-        coords=dict(
-            doy=doys,
-            lat=lats,
-            lon=lons
-            )
-    )
-    
-    # Write each percentile as a separate output variable
-    for i, pctile in enumerate(pctiles):
-        IVT_at_pctiles_ds['IVT_pctile_'+str(pctile)] = \
-            (['doy','lat','lon'], IVT_pctiles_out_data[:,i,:,:])
-        IVT_at_pctiles_ds['IVT_pctile_'+str(pctile)].attrs['units'] = 'kg/m/s'
-    
-    IVT_at_pctiles_ds.lat.attrs['units'] = 'degrees_north'
-    IVT_at_pctiles_ds.lon.attrs['units'] = 'degrees_east'  
-    
-    IVT_at_pctiles_ds.attrs['data_source'] = AR_config['data_source']
-    IVT_at_pctiles_ds.attrs['IVT_data_origin'] = AR_config['IVT_data_origin']
-    IVT_at_pctiles_ds.attrs['IVT_vert_coord'] = AR_config['IVT_vert_coord']
-    IVT_at_pctiles_ds.attrs['IVT_climatology_start_year'] = start_year
-    IVT_at_pctiles_ds.attrs['IVT_climatology_end_year'] = end_year
-    IVT_at_pctiles_ds.attrs['IVT_climatology_timestep_hrs'] = timestep_hrs
+    ds_out = xr.Dataset(coords=dict(doy=doys, lat=lats, lon=lons))
+    for i, p in enumerate(pctiles):
+        ds_out[f'IVT_pctile_{p}'] = (['doy', 'lat', 'lon'], data[:, i, :, :])
+        ds_out[f'IVT_pctile_{p}'].attrs['units'] = 'kg/m/s'
+    ds_out.lat.attrs['units'] = 'degrees_north'
+    ds_out.lon.attrs['units'] = 'degrees_east'
 
-    if AR_config['IVT_vert_coord'] == 'pressure_levels':
-        IVT_at_pctiles_ds.attrs['IVT_calc_pressure_levels'] = \
-            str(AR_config['IVT_calc_plevs'])
-    elif AR_config['IVT_vert_coord'] == 'model_levels':
-        IVT_at_pctiles_ds.attrs['IVT_calc_model_levels'] = \
-            str(AR_config['IVT_calc_mlevs'])
-        
-    minlat = AR_config['min_lat']
-    maxlat = AR_config['max_lat']
-    minlon = AR_config['min_lon']
-    maxlon = AR_config['max_lon']
-    lonres = AR_config['lon_res']
-    start_doy = str(doys[0])
-    end_doy = str(doys[-1])
+    ds_out.attrs.update({
+        'data_source': AR_config['data_source'],
+        'IVT_data_origin': AR_config['IVT_data_origin'],
+        'IVT_vert_coord': AR_config['IVT_vert_coord'],
+        'IVT_climatology_start_year': start_year,
+        'IVT_climatology_end_year': end_year,
+        'IVT_climatology_timestep_hrs': timestep_hrs
+    })
 
-    if ((minlat == -90) and (maxlat == 90) and ((maxlon+lonres) - minlon == 360)) and\
-        (start_doy == '1' and end_doy == '365'):
-        fname = 'IVT_at_pctiles_'+AR_config['data_source']+\
-            f'_global_{timestep_hrs}hr_{start_year}_{end_year}_climo.nc'    
-    elif ((minlat == 10) and (maxlat == 90) and ((maxlon+lonres) - minlon == 360)) and\
-        (start_doy == '1' and end_doy == '365'):
-        fname = 'IVT_at_pctiles_'+AR_config['data_source']+\
-            f'_NH_{timestep_hrs}hr_{start_year}_{end_year}_climo.nc'  
-    elif ((minlat == -90) and (maxlat == -10) and ((maxlon+lonres) - minlon == 360)) and\
-        (start_doy == '1' and end_doy == '365'):
-        fname = 'IVT_at_pctiles_'+AR_config['data_source']+\
-            f'_SH_{timestep_hrs}hr_{start_year}_{end_year}_climo.nc'  
-    else:
-        fname = 'IVT_at_pctiles_'+AR_config['data_source']+\
-            f'_lat_{minlat}_{maxlat}_lon_{minlon}_{maxlon}_{timestep_hrs}hr_doys_{start_doy}_{end_doy}_{start_year}_{end_year}_climo.nc' 
-    
-    IVT_at_pctiles_ds.to_netcdf(AR_config['IVT_at_pctiles_dir']+fname)
-
+    fname = f"IVT_at_pctiles_{AR_config['data_source']}_{start_year}_{end_year}.nc"
+    out_path = Path(AR_config['IVT_at_pctiles_dir']) / fname
+    ds_out.to_netcdf(out_path)
+    print(f"Output saved to {out_path}")
 
 def parse_args():
     """
@@ -164,40 +126,35 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         'start_doy', 
+        type=int, 
         help='Day of year (1-365) at which to start calculations'
-        )
+    )
     parser.add_argument(
-        'end_doy',
+        'end_doy', 
+        type=int, 
         help='Day of year (1-365) at which to end calculations'
-        )
+    )
     parser.add_argument(
-        'AR_ID_config_path',
+        'AR_ID_config_path', 
         help='Path to AR ID configuration file'
-        )
-    args = parser.parse_args()
-    
-    return args.start_doy, args.end_doy, args.AR_ID_config_path
-
+    )
+    return parser.parse_args()
 
 def main():
-    start_doy, end_doy, AR_ID_config_path = parse_args()
-        
-    with open(AR_ID_config_path) as f:
-        AR_config = hjson.loads(f.read())
+    args = parse_args()
     
+    with open(args.AR_ID_config_path) as f:
+        AR_config = hjson.loads(f.read())
+
     start_year = AR_config['IVT_climatology_start_year']
     end_year = AR_config['IVT_climatology_end_year']
     timestep_hrs = AR_config['IVT_climatology_timestep_hrs']
-    
-    doys, pctiles, lats, lons, IVT_pctiles_out_data = calc_IVT_at_pctiles(
-        AR_config, start_year, end_year, timestep_hrs, start_doy, end_doy
-        )
-    
-    write_IVT_at_pctiles_output_file(
-        AR_config, start_year, end_year, timestep_hrs, doys, pctiles,
-        lats, lons, IVT_pctiles_out_data
-        )
 
+    doys, pctiles, lats, lons, data = calc_IVT_at_pctiles(
+        AR_config, start_year, end_year, timestep_hrs, args.start_doy, args.end_doy
+    )
+
+    write_output(AR_config, start_year, end_year, timestep_hrs, doys, pctiles, lats, lons, data)
 
 if __name__ == '__main__':
     main()
